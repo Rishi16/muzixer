@@ -34,22 +34,23 @@ def bpm_compatible(current, candidate, tolerance=4):
 
 class DownloadWorker(QThread):
     status = Signal(str)
-    done = Signal(object)
+    done = Signal(object, str)
 
     def __init__(self, video_id, title):
         super().__init__()
         self.video_id = video_id
         self.title = title
+        self.file_path = None
 
     def run(self):
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
         output_template = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
 
         for f in os.listdir(DOWNLOAD_DIR):
             if self.title.lower() in f.lower():
+                self.file_path = os.path.join(DOWNLOAD_DIR, f)
                 self.status.emit(f"Skipped (exists): {self.title}")
-                self.done.emit(self)
+                self.done.emit(self, self.file_path)
                 return
 
         self.status.emit(f"Downloading: {self.title}")
@@ -60,7 +61,6 @@ class DownloadWorker(QThread):
                 "--ffmpeg-location", "C:\\ffmpeg\\bin",
                 "-x",
                 "--audio-format", "mp3",
-                "--audio-quality", "0",
                 "-o", output_template,
                 f"https://music.youtube.com/watch?v={self.video_id}"
             ],
@@ -68,8 +68,13 @@ class DownloadWorker(QThread):
             stderr=subprocess.DEVNULL
         )
 
+        for f in os.listdir(DOWNLOAD_DIR):
+            if self.title.lower() in f.lower():
+                self.file_path = os.path.join(DOWNLOAD_DIR, f)
+                break
+
         self.status.emit(f"Downloaded: {self.title}")
-        self.done.emit(self)
+        self.done.emit(self, self.file_path)
 
 
 class MainWindow(QWidget):
@@ -174,9 +179,24 @@ class MainWindow(QWidget):
     def update_status(self, text):
         self.status_label.setText(f"Status: {text}")
 
-    def cleanup_worker(self, worker):
+    def cleanup_worker(self, worker, file_path):
         if worker in self.download_workers:
             self.download_workers.remove(worker)
+
+        if file_path and os.path.exists(file_path):
+            bpm = analyze_bpm(file_path)
+            self.track_bpms[file_path] = bpm
+
+            if self.current_bpm is None:
+                self.current_bpm = bpm
+                self.status_label.setText(f"Current BPM set to {bpm}")
+            else:
+                compatible = bpm_compatible(self.current_bpm, bpm)
+                symbol = "✔" if compatible else "✖"
+                self.status_label.setText(
+                    f"{symbol} {os.path.basename(file_path)} – BPM {bpm}"
+                )
+
         worker.quit()
         worker.wait()
 
