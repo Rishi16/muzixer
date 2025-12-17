@@ -1,212 +1,246 @@
 import sys
 import os
 import subprocess
-import librosa
-import numpy as np
-
+import re
+import shlex
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QLabel, QVBoxLayout,
-    QLineEdit, QPushButton, QListWidget, QHBoxLayout
+    QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
+    QLineEdit, QPushButton, QListWidget, QTableWidget,
+    QTableWidgetItem
 )
 from PySide6.QtCore import QThread, Signal
 from ytmusicapi import YTMusic
+import librosa
 
-
+# ================= CONFIG =================
 DOWNLOAD_DIR = os.path.abspath("downloads")
+FFMPEG_PATH = r"C:\ffmpeg\bin"   # adjust if needed
 
+# ================= UTILS =================
+def log(msg):
+    print(msg)
 
-def analyze_bpm(file_path):
-    y, sr = librosa.load(file_path, mono=True)
-    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-    return round(float(tempo))
+def sanitize_title(title):
+    return re.sub(r"[^a-zA-Z0-9 _-]", "", title)
 
+def analyze_bpm(path):
+    try:
+        y, sr = librosa.load(path, mono=True)
+        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+        return int(round(float(tempo)))
+    except Exception as e:
+        log(f"BPM failed for {path}: {e}")
+        return None
 
-def bpm_compatible(current, candidate, tolerance=4):
-    if current is None or candidate is None:
+def bpm_compatible(base, other, tol=4):
+    if not base or not other:
         return False
-
     return (
-        abs(current - candidate) <= tolerance or
-        abs(current - (candidate * 2)) <= tolerance or
-        abs(current - (candidate / 2)) <= tolerance
+        abs(base - other) <= tol or
+        abs(base - (other * 2)) <= tol or
+        abs(base - (other / 2)) <= tol
     )
 
-
+# ================= DOWNLOAD THREAD =================
 class DownloadWorker(QThread):
     status = Signal(str)
-    done = Signal(object, str)
+    done = Signal(str)
 
     def __init__(self, video_id, title):
         super().__init__()
         self.video_id = video_id
         self.title = title
-        self.file_path = None
 
     def run(self):
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        output_template = os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s")
 
-        for f in os.listdir(DOWNLOAD_DIR):
-            if self.title.lower() in f.lower():
-                self.file_path = os.path.join(DOWNLOAD_DIR, f)
-                self.status.emit(f"Skipped (exists): {self.title}")
-                self.done.emit(self, self.file_path)
-                return
+        safe_title = sanitize_title(self.title)
+        output_tpl = os.path.join(DOWNLOAD_DIR, f"{safe_title}.%(ext)s")
+
+        cmd = [
+            sys.executable, "-m", "yt_dlp",
+            "--ffmpeg-location", FFMPEG_PATH,
+            "-x", "--audio-format", "mp3",
+            "--audio-quality", "0",
+            "-o", output_tpl,
+            f"https://www.youtube.com/watch?v={self.video_id}"
+        ]
 
         self.status.emit(f"Downloading: {self.title}")
+        log("CMD:", " ".join(cmd))
 
-        subprocess.run(
-            [
-                "yt-dlp",
-                "--ffmpeg-location", "C:\\ffmpeg\\bin",
-                "-x",
-                "--audio-format", "mp3",
-                "-o", output_template,
-                f"https://music.youtube.com/watch?v={self.video_id}"
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+        result = subprocess.run(
+            " ".join(shlex.quote(c) for c in cmd),
+            shell=True, capture_output=True, text=True
         )
 
+        log(result.stdout)
+        log(result.stderr)
+
         for f in os.listdir(DOWNLOAD_DIR):
-            if self.title.lower() in f.lower():
-                self.file_path = os.path.join(DOWNLOAD_DIR, f)
-                break
+            if safe_title.lower() in f.lower() and f.endswith(".mp3"):
+                self.done.emit(os.path.join(DOWNLOAD_DIR, f))
+                return
 
-        self.status.emit(f"Downloaded: {self.title}")
-        self.done.emit(self, self.file_path)
+        self.done.emit(None)
 
-
+# ================= MAIN UI =================
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-
-        self.setWindowTitle("YouTube DJ Lab")
-        self.resize(1100, 650)
+        self.setWindowTitle("Muzixer – YouTube DJ Lab")
+        self.resize(1200, 750)
 
         self.ytmusic = YTMusic()
         self.search_results = []
-        self.upnext_tracks = []
-        self.download_workers = []
-        self.track_bpms = {}
+        self.reco_tracks = []
         self.current_bpm = None
+        self.track_bpms = {}
 
-        # Layouts
-        main_layout = QVBoxLayout()
-        lists_layout = QHBoxLayout()
+        self.build_ui()
+        self.refresh_library()
 
-        # Search
+    # ---------- UI ----------
+    def build_ui(self):
+        main = QVBoxLayout()
+        lists = QHBoxLayout()
+
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("Search YouTube Music")
-        self.search_button = QPushButton("Search")
+        self.search_btn = QPushButton("Search")
 
-        # Lists
         self.search_list = QListWidget()
-        self.upnext_list = QListWidget()
-        self.upnext_list.setSelectionMode(QListWidget.MultiSelection)
+        self.reco_list = QListWidget()
+        self.reco_list.setSelectionMode(QListWidget.MultiSelection)
 
-        # Download button
-        self.download_button = QPushButton("Download Selected Recommendation")
-        self.status_label = QLabel("Status: Idle")
+        lists.addWidget(self.search_list)
+        lists.addWidget(self.reco_list)
 
-        lists_layout.addWidget(self.search_list)
-        lists_layout.addWidget(self.upnext_list)
+        self.download_btn = QPushButton("Download Selected")
+        self.status = QLabel("Idle")
 
-        main_layout.addWidget(self.search_box)
-        main_layout.addWidget(self.search_button)
-        main_layout.addLayout(lists_layout)
-        main_layout.addWidget(self.download_button)
-        main_layout.addWidget(self.status_label)
+        # ---- Library ----
+        self.lib_search = QLineEdit()
+        self.lib_search.setPlaceholderText("Search downloaded songs (name or BPM)")
 
-        self.setLayout(main_layout)
+        self.library = QTableWidget()
+        self.library.setColumnCount(2)
+        self.library.setHorizontalHeaderLabels(["BPM", "Song"])
+        self.library.setSortingEnabled(True)
 
-        # Signals
-        self.search_button.clicked.connect(self.perform_search)
-        self.search_list.itemClicked.connect(self.fetch_up_next)
-        self.download_button.clicked.connect(self.download_selected)
+        main.addWidget(self.search_box)
+        main.addWidget(self.search_btn)
+        main.addLayout(lists)
+        main.addWidget(self.download_btn)
+        main.addWidget(self.status)
+        main.addWidget(QLabel("Downloaded Library"))
+        main.addWidget(self.lib_search)
+        main.addWidget(self.library)
 
-    def perform_search(self):
-        query = self.search_box.text().strip()
-        if not query:
+        self.setLayout(main)
+
+        # ---- Signals ----
+        self.search_btn.clicked.connect(self.search)
+        self.search_list.itemClicked.connect(self.load_recommendations)
+        self.download_btn.clicked.connect(self.download_selected)
+        self.lib_search.textChanged.connect(self.filter_library)
+
+    # ---------- SEARCH ----------
+    def search(self):
+        q = self.search_box.text().strip()
+        if not q:
             return
 
         self.search_list.clear()
-        self.upnext_list.clear()
+        self.reco_list.clear()
+        self.search_results = self.ytmusic.search(q, filter="songs", limit=10)
 
-        self.search_results = self.ytmusic.search(query, filter="songs", limit=10)
-
-        for item in self.search_results:
-            title = item.get("title", "Unknown")
-            artists = ", ".join(a["name"] for a in item.get("artists", []))
+        for r in self.search_results:
+            title = r["title"]
+            artists = ", ".join(a["name"] for a in r.get("artists", []))
             self.search_list.addItem(f"{title} — {artists}")
 
-    def fetch_up_next(self):
-        index = self.search_list.currentRow()
-        selected = self.search_results[index]
+    # ---------- RECOMMEND ----------
+    def load_recommendations(self):
+        idx = self.search_list.currentRow()
+        video_id = self.search_results[idx]["videoId"]
 
-        video_id = selected.get("videoId")
-        if not video_id:
-            return
-
+        self.reco_list.clear()
         watch = self.ytmusic.get_watch_playlist(video_id)
-        self.upnext_tracks = watch.get("tracks", [])[:10]
+        self.reco_tracks = watch["tracks"][:10]
 
-        self.upnext_list.clear()
-        for track in self.upnext_tracks:
-            title = track.get("title", "Unknown")
-            artists = ", ".join(a["name"] for a in track.get("artists", []))
-            self.upnext_list.addItem(f"{title} — {artists}")
+        for t in self.reco_tracks:
+            self.reco_list.addItem(t["title"])
 
+    # ---------- DOWNLOAD ----------
     def download_selected(self):
-        selected_items = self.upnext_list.selectedIndexes()
-        if not selected_items:
-            return
-
-        for index_obj in selected_items:
-            index = index_obj.row()
-            track = self.upnext_tracks[index]
-
-            title = track.get("title", "Unknown")
-            video_id = track.get("videoId")
-
-            worker = DownloadWorker(video_id, title)
+        for idx in self.reco_list.selectedIndexes():
+            track = self.reco_tracks[idx.row()]
+            worker = DownloadWorker(track["videoId"], track["title"])
             worker.status.connect(self.update_status)
-            worker.done.connect(self.cleanup_worker)
-
-            self.download_workers.append(worker)
+            worker.done.connect(self.download_finished)
             worker.start()
 
-    def update_status(self, text):
-        self.status_label.setText(f"Status: {text}")
+    def update_status(self, msg):
+        self.status.setText(msg)
 
-    def cleanup_worker(self, worker, file_path):
-        if worker in self.download_workers:
-            self.download_workers.remove(worker)
+    def download_finished(self, path):
+        if not path:
+            self.status.setText("Download failed")
+            return
 
-        if file_path and os.path.exists(file_path):
-            bpm = analyze_bpm(file_path)
-            self.track_bpms[file_path] = bpm
+        bpm = analyze_bpm(path)
+        bpm_txt = str(bpm) if bpm else "UNK"
 
-            if self.current_bpm is None:
-                self.current_bpm = bpm
-                self.status_label.setText(f"Current BPM set to {bpm}")
-            else:
-                compatible = bpm_compatible(self.current_bpm, bpm)
-                symbol = "✔" if compatible else "✖"
-                self.status_label.setText(
-                    f"{symbol} {os.path.basename(file_path)} – BPM {bpm}"
-                )
+        new_name = f"{bpm_txt} - {os.path.basename(path)}"
+        new_path = os.path.join(DOWNLOAD_DIR, new_name)
+        os.rename(path, new_path)
 
-        worker.quit()
-        worker.wait()
+        self.track_bpms[new_path] = bpm
+        if not self.current_bpm and bpm:
+            self.current_bpm = bpm
 
+        self.status.setText(f"Downloaded: {new_name}")
+        self.refresh_library()
+        self.update_reco_bpm()
 
+    # ---------- LIBRARY ----------
+    def refresh_library(self):
+        self.library.setRowCount(0)
+
+        for f in sorted(os.listdir(DOWNLOAD_DIR)):
+            if not f.endswith(".mp3"):
+                continue
+            bpm = f.split(" - ")[0]
+            row = self.library.rowCount()
+            self.library.insertRow(row)
+            self.library.setItem(row, 0, QTableWidgetItem(bpm))
+            self.library.setItem(row, 1, QTableWidgetItem(f))
+
+    def filter_library(self, text):
+        text = text.lower()
+        for row in range(self.library.rowCount()):
+            bpm = self.library.item(row, 0).text().lower()
+            name = self.library.item(row, 1).text().lower()
+            self.library.setRowHidden(row, not (text in bpm or text in name))
+
+    # ---------- BPM UI ----------
+    def update_reco_bpm(self):
+        for i, track in enumerate(self.reco_tracks):
+            title = track["title"]
+            safe = sanitize_title(title)
+            for f in os.listdir(DOWNLOAD_DIR):
+                if safe.lower() in f.lower():
+                    bpm = int(f.split(" - ")[0]) if f.split(" - ")[0].isdigit() else None
+                    symbol = "✔" if bpm_compatible(self.current_bpm, bpm) else "✖"
+                    self.reco_list.item(i).setText(f"{symbol} {title} ({bpm})")
+
+# ================= MAIN =================
 def main():
     app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
+    w = MainWindow()
+    w.show()
     sys.exit(app.exec())
-
 
 if __name__ == "__main__":
     main()
