@@ -10,13 +10,21 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
     QLineEdit, QPushButton, QListWidget, QSplitter,
     QTableWidget, QTableWidgetItem, QProgressBar, QTextEdit,
-    QCheckBox, QFrame, QHeaderView, QAbstractItemView, QDialog, QTextBrowser
+    QCheckBox, QHeaderView, QAbstractItemView, QDialog, QTextBrowser
 )
 from PySide6.QtCore import QThread, Signal, QTimer, QMutex, Qt, QObject
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
 
 from ytmusicapi import YTMusic
 import librosa
+from librosa import feature as _librosa_feature
+
+# Try optional mutagen for ID3 tagging
+try:
+    from mutagen.easyid3 import EasyID3  # type: ignore
+    ID3_AVAILABLE = True
+except Exception:
+    ID3_AVAILABLE = False
 
 # ================= CONFIG =================
 DOWNLOAD_DIR = Path("downloads").absolute()
@@ -179,30 +187,103 @@ def get_cached_files():
     return _file_cache
 
 # ================= AUDIO ANALYSIS =================
+# Krumhansl-Schmuckler key profiles (normalized) for major/minor
+_KS_PROFILE_MAJOR = [
+    6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
+    2.52, 5.19, 2.39, 3.66, 2.29, 2.88
+]
+_KS_PROFILE_MINOR = [
+    6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
+    2.54, 4.75, 3.98, 2.69, 3.34, 3.17
+]
+_KEYS_12 = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+def _rotate(lst, n):
+    n %= len(lst)
+    return lst[n:] + lst[:n]
+
+def infer_key_mode_from_chroma(chroma):
+    """Infer pitch class (C..B) and mode ('major'/'minor') using K-S profiles.
+    chroma: (12, frames) array. Returns (key_name, mode).
+    """
+    import numpy as _np  # local import to avoid global aliasing
+    if chroma is None or chroma.size == 0:
+        return None, None
+    chroma_mean = chroma.mean(axis=1)
+    # Normalize
+    if chroma_mean.max() > 0:
+        chroma_mean = chroma_mean / (chroma_mean.max() + 1e-9)
+    best_score = -1.0
+    best_key = None
+    best_mode = None
+    for i in range(12):
+        prof_maj = _np.array(_rotate(_KS_PROFILE_MAJOR, i))
+        prof_min = _np.array(_rotate(_KS_PROFILE_MINOR, i))
+        # Normalize profiles
+        prof_maj = prof_maj / (prof_maj.max() + 1e-9)
+        prof_min = prof_min / (prof_min.max() + 1e-9)
+        s_maj = float(_np.dot(chroma_mean, prof_maj))
+        s_min = float(_np.dot(chroma_mean, prof_min))
+        if s_maj > best_score:
+            best_score = s_maj; best_key = _KEYS_12[i]; best_mode = "major"
+        if s_min > best_score:
+            best_score = s_min; best_key = _KEYS_12[i]; best_mode = "minor"
+    return best_key, best_mode
+
+def pick_informative_segment(y, sr, target_seconds=30):
+    """Pick a high-energy contiguous segment to avoid long intros/silence.
+    Returns a mono array segment of ~target_seconds length (or shorter if not enough audio).
+    """
+    import numpy as _np
+    if y is None or len(y) == 0:
+        return y
+    seg_len = int(target_seconds * sr)
+    if len(y) <= seg_len:
+        return y
+    # Window step of 5 seconds
+    step = int(5 * sr)
+    best_start = 0
+    best_energy = -1.0
+    for start in range(0, max(1, len(y) - seg_len + 1), step):
+        end = start + seg_len
+        window = y[start:end]
+        # Energy: sum of squares (robust for beats)
+        e = float(_np.sum(window.astype(_np.float32) ** 2))
+        if e > best_energy:
+            best_energy = e
+            best_start = start
+    return y[best_start: best_start + seg_len]
+
 def detect_key(path):
-    """Detect musical key using chromagram analysis with caching."""
+    """Detect musical key using chromagram analysis with caching (mode-aware)."""
     path_str = str(path)
     with MutexGuard(CACHE_MUTEX):
         if path_str in AUDIO_ANALYSIS_CACHE and 'key' in AUDIO_ANALYSIS_CACHE[path_str]:
-            return AUDIO_ANALYSIS_CACHE[path_str]['key']
+            # If we cached (key, mode), return just key for backward compat
+            cached = AUDIO_ANALYSIS_CACHE[path_str]['key']
+            if isinstance(cached, dict):
+                return cached.get('name')
+            return cached
     try:
-        y, sr = librosa.load(path_str, mono=True, duration=30)  # Analyze first 30s
-        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=2048)
-        avg = chroma.mean(axis=1)
-        idx = int(avg.argmax())
-        keys = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-        result = keys[idx]
+        # Load up to 90 seconds then pick a 30s high-energy window
+        y_full, sr = librosa.load(path_str, mono=True, duration=90)
+        y = pick_informative_segment(y_full, sr, target_seconds=30)
+        chroma = _librosa_feature.chroma_cqt(y=y, sr=sr, hop_length=2048)
+        key_name, mode = infer_key_mode_from_chroma(chroma)
         with MutexGuard(CACHE_MUTEX):
-            AUDIO_ANALYSIS_CACHE.setdefault(path_str, {})['key'] = result
-        return result
-    except Exception:
+            AUDIO_ANALYSIS_CACHE.setdefault(path_str, {})['key'] = {"name": key_name, "mode": mode}
+        return key_name
+    except Exception as e:
+        debug_log("analysis", f"detect_key failed: {e}")
         return None
 
 def key_to_camelot(key, mode="minor"):
-    """Convert musical key to Camelot notation."""
+    """Convert musical key to Camelot notation. Mode is 'major' or 'minor'."""
     if not key:
         return None
     major, minor = KEY_MAP.get(key, (None, None))
+    if mode not in ("major", "minor"):
+        mode = "minor"
     camelot = minor if mode == "minor" else major
     return camelot
 
@@ -213,36 +294,41 @@ def analyze_bpm(path):
         if path_str in AUDIO_ANALYSIS_CACHE and 'bpm' in AUDIO_ANALYSIS_CACHE[path_str]:
             return AUDIO_ANALYSIS_CACHE[path_str]['bpm']
     try:
-        y, sr = librosa.load(path_str, mono=True, duration=30, sr=22050)
+        y_full, sr = librosa.load(path_str, mono=True, duration=90, sr=22050)
+        y = pick_informative_segment(y_full, sr, target_seconds=30)
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr, hop_length=1024)
-        result = int(round(float(tempo)))
+        result = int(round(float(tempo))) if tempo is not None else None
         with MutexGuard(CACHE_MUTEX):
             AUDIO_ANALYSIS_CACHE.setdefault(path_str, {})['bpm'] = result
         return result
-    except Exception:
+    except Exception as e:
+        debug_log("analysis", f"analyze_bpm failed: {e}")
         return None
 
 def analyze_audio_batch(path):
-    """Analyze both BPM and key in a single pass for efficiency."""
+    """Analyze both BPM and key (with mode) in a single pass for efficiency."""
     path_str = str(path)
     with MutexGuard(CACHE_MUTEX):
         entry = AUDIO_ANALYSIS_CACHE.get(path_str, {})
         if 'bpm' in entry and 'key' in entry:
-            return entry['bpm'], entry['key']
+            k = entry['key']
+            if isinstance(k, dict):
+                return entry['bpm'], k.get('name'), k.get('mode')
+            return entry['bpm'], k, None
     try:
-        y, sr = librosa.load(path_str, mono=True, duration=30, sr=22050)
+        y_full, sr = librosa.load(path_str, mono=True, duration=90, sr=22050)
+        y = pick_informative_segment(y_full, sr, target_seconds=30)
+        # Emit no progress here (pure function) — progress will be emitted from worker
         tempo, _ = librosa.beat.beat_track(y=y, sr=sr, hop_length=1024)
-        bpm = int(round(float(tempo)))
-        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=2048)
-        avg = chroma.mean(axis=1)
-        idx = int(avg.argmax())
-        keys = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-        key = keys[idx]
+        bpm = int(round(float(tempo))) if tempo is not None else None
+        chroma = _librosa_feature.chroma_cqt(y=y, sr=sr, hop_length=2048)
+        key_name, mode = infer_key_mode_from_chroma(chroma)
         with MutexGuard(CACHE_MUTEX):
-            AUDIO_ANALYSIS_CACHE.setdefault(path_str, {}).update({'bpm': bpm, 'key': key})
-        return bpm, key
-    except Exception:
-        return None, None
+            AUDIO_ANALYSIS_CACHE.setdefault(path_str, {}).update({'bpm': bpm, 'key': {"name": key_name, "mode": mode}})
+        return bpm, key_name, mode
+    except Exception as e:
+        debug_log("analysis", f"analyze_audio_batch failed: {e}")
+        return None, None, None
 
 # ================= HELPERS =================
 def sanitize(text):
@@ -301,6 +387,42 @@ def write_metadata(audio_path: Path, meta: dict):
             json.dump(meta, f, indent=2)
     except Exception as e:
         debug_log("error", f"Metadata write failed: {e}")
+
+# Embed ID3 tags if mutagen is available
+def embed_id3_tags(audio_path: Path, meta: dict):
+    if not ID3_AVAILABLE:
+        debug_log("id3", "mutagen not available, skipping ID3 tags")
+        return
+    try:
+        tags = EasyID3(str(audio_path))
+    except Exception:
+        try:
+            # Create tags if file lacks ID3 header
+            from mutagen.id3 import ID3, ID3NoHeaderError  # type: ignore
+            try:
+                ID3(str(audio_path))
+            except ID3NoHeaderError:
+                from mutagen.id3 import ID3 as _ID3  # type: ignore
+                _id3 = _ID3()
+                _id3.save(str(audio_path))
+            tags = EasyID3(str(audio_path))
+        except Exception as e:
+            debug_log("id3", f"Failed to initialize ID3: {e}")
+            return
+    try:
+        if meta.get("title"):
+            tags["title"] = [meta["title"]]
+        if meta.get("artist"):
+            tags["artist"] = [meta["artist"]]
+        if meta.get("bpm"):
+            tags["bpm"] = [str(meta["bpm"])]
+        # Use Camelot code in initial key for DJ compatibility
+        if meta.get("camelot"):
+            tags["initialkey"] = [meta["camelot"]]
+        tags.save()
+        debug_log("id3", f"ID3 tags written for {audio_path.name}")
+    except Exception as e:
+        debug_log("id3", f"Failed to write ID3: {e}")
 
 # ================= CUSTOM LIST/TABLE WIDGETS =================
 class NavigableList(QListWidget):
@@ -474,6 +596,7 @@ class DownloadWorker(QThread):
 class AudioAnalysisWorker(QThread):
     analysis_complete = Signal(str, int, str)  # path, bpm, camelot
     error_occurred = Signal(str)
+    progress_update = Signal(int, str)  # percent, stage text
 
     def __init__(self, file_path):
         super().__init__()
@@ -481,9 +604,31 @@ class AudioAnalysisWorker(QThread):
 
     def run(self):
         try:
-            bpm, key = analyze_audio_batch(self.file_path)
-            camelot = key_to_camelot(key) if key else "UNK"
+            self.progress_update.emit(5, "Loading audio…")
+            # Do batch analysis and emit staged progress
+            bpm, key_name, mode = analyze_audio_batch(self.file_path)
+            self.progress_update.emit(65, "Estimating tempo…")
+            # If BPM missing (edge), retry on a later offset quick pass
+            if not bpm:
+                try:
+                    y_full, sr = librosa.load(self.file_path, mono=True, duration=120, sr=22050)
+                    y = pick_informative_segment(y_full, sr, target_seconds=30)
+                    tempo, _ = librosa.beat.beat_track(y=y, sr=sr, hop_length=1024)
+                    bpm = int(round(float(tempo))) if tempo is not None else None
+                except Exception:
+                    pass
+            self.progress_update.emit(85, "Detecting key…")
+            if key_name is None or mode is None:
+                try:
+                    y_full, sr = librosa.load(self.file_path, mono=True, duration=90, sr=22050)
+                    y = pick_informative_segment(y_full, sr, target_seconds=30)
+                    chroma = _librosa_feature.chroma_cqt(y=y, sr=sr, hop_length=2048)
+                    key_name, mode = infer_key_mode_from_chroma(chroma)
+                except Exception:
+                    pass
+            camelot = key_to_camelot(key_name, mode) if key_name else "UNK"
             event_log(f"Analyzed: {Path(self.file_path).name} (BPM: {bpm if bpm else 'UNK'}, Key: {camelot})")
+            self.progress_update.emit(100, "Done")
             self.analysis_complete.emit(self.file_path, bpm or 0, camelot)
         except Exception as e:
             self.error_occurred.emit(str(e))
@@ -498,7 +643,9 @@ class MainWindow(QWidget):
 
         # Increase overall UI font
         app_font = QFont("Segoe UI", 11)
-        QApplication.instance().setFont(app_font)
+        app_instance = QApplication.instance()
+        if app_instance:
+            app_instance.setFont(app_font)
 
         # Initialize YouTube Music API
         try:
@@ -532,8 +679,16 @@ class MainWindow(QWidget):
         self.filter_timer.setSingleShot(True)
         self.filter_timer.timeout.connect(self.filter_library)
 
-        self.active_workers = []
-        self.logger_connected = False  # prevent double console connections
+        # Debounced recommendations loader for search selections
+        self.reco_timer = QTimer()
+        self.reco_timer.setSingleShot(True)
+        self.reco_timer.timeout.connect(self.load_recommendations)
+
+        # Track progress bar usage
+        self.network_progress_active = False
+        self.analysis_progress_active = False
+        # Track active download operations to prevent spam
+        self.download_in_progress = 0
 
         self.build_ui()
         self.apply_fonts()
@@ -555,20 +710,35 @@ class MainWindow(QWidget):
         self.search_btn = QPushButton("Search")
         self.search_btn.clicked.connect(self.perform_search)
 
-        main_layout.addWidget(QLabel("Search YouTube Music:"))
-        main_layout.addWidget(self.search_box)
-        main_layout.addWidget(self.search_btn)
+        search_header = QWidget()
+        search_header_layout = QVBoxLayout(search_header)
+        search_header_layout.setContentsMargins(0, 0, 0, 0)
+        search_header_layout.addWidget(QLabel("Search YouTube Music:"))
+        search_header_layout.addWidget(self.search_box)
+        search_header_layout.addWidget(self.search_btn)
+        main_layout.addWidget(search_header)
+        main_layout.setStretchFactor(search_header, 0)
 
         # Progress
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setFormat("%p%")
         main_layout.addWidget(self.progress_bar)
+        main_layout.setStretchFactor(self.progress_bar, 0)
 
         # Search results + recommendations (YouTube)
-        lists_layout = QHBoxLayout()
+        lists_container = QWidget()
+        lists_layout = QHBoxLayout(lists_container)
+        lists_layout.setContentsMargins(0, 0, 0, 0)
         self.search_list = NavigableList()
         self.reco_list = NavigableList()
         self.reco_list.setSelectionMode(QListWidget.MultiSelection)
+
+        # Auto-load recommendations when a search result is selected (debounced)
+        self.search_list.itemSelectionChanged.connect(self.queue_recommendations_for_current)
+        # Double-click to load immediately and focus recos
+        self.search_list.itemDoubleClicked.connect(lambda _: self.load_recommendations_and_focus())
 
         # Wire navigation behavior
         self.search_list.on_right = lambda: self.focus_recommendations()
@@ -581,13 +751,17 @@ class MainWindow(QWidget):
 
         lists_layout.addWidget(self.search_list)
         lists_layout.addWidget(self.reco_list)
-        main_layout.addWidget(QLabel("Search Results → YouTube Recommendations:"))
-        main_layout.addLayout(lists_layout)
+        lists_header = QLabel("Search Results → YouTube Recommendations:")
+        main_layout.addWidget(lists_header)
+        main_layout.addWidget(lists_container)
+        # Give lists a smaller vertical share vs library
+        main_layout.setStretchFactor(lists_container, 1)
 
         # Download
         self.download_btn = QPushButton("Download Selected")
         self.download_btn.clicked.connect(self.download_selected)
         main_layout.addWidget(self.download_btn)
+        main_layout.setStretchFactor(self.download_btn, 0)
 
         # Library (split into two panes)
         main_layout.addWidget(QLabel("Downloaded Library (Left) → Next Up From Library (Right):"))
@@ -631,6 +805,8 @@ class MainWindow(QWidget):
         lib_splitter.setStretchFactor(1, 2)
 
         main_layout.addWidget(lib_splitter)
+        # Make the library section take more space vertically than search
+        main_layout.setStretchFactor(lib_splitter, 3)
 
         # Console bottom with controls
         console_container = QWidget()
@@ -700,35 +876,54 @@ class MainWindow(QWidget):
 
     def setup_shortcuts(self):
         """Keyboard shortcuts for fast, keyboard-driven control."""
-        QShortcut(QKeySequence("Ctrl+F"), self, activated=lambda: self.search_box.setFocus())
-        QShortcut(QKeySequence("Ctrl+L"), self, activated=lambda: self.lib_search.setFocus())
+        sc = QShortcut(QKeySequence("Ctrl+F"), self)
+        sc.activated.connect(lambda: self.search_box.setFocus())
+        sc = QShortcut(QKeySequence("Ctrl+L"), self)
+        sc.activated.connect(lambda: self.lib_search.setFocus())
         # Show YouTube recommendations for current selection (any section)
-        QShortcut(QKeySequence("Ctrl+R"), self, activated=self.show_youtube_recommendations_for_selection)
+        sc = QShortcut(QKeySequence("Ctrl+R"), self)
+        sc.activated.connect(self.show_youtube_recommendations_for_selection)
 
         # Move focus between lists
-        QShortcut(QKeySequence("Right"), self, activated=self.focus_recommendations)
-        QShortcut(QKeySequence("Left"), self, activated=self.focus_search_results)
+        sc = QShortcut(QKeySequence("Right"), self)
+        sc.activated.connect(self.focus_recommendations)
+        sc = QShortcut(QKeySequence("Left"), self)
+        sc.activated.connect(self.focus_search_results)
 
         # Space action fallback
-        QShortcut(QKeySequence("Space"), self, activated=self.space_action_global)
+        sc = QShortcut(QKeySequence("Space"), self)
+        sc.activated.connect(self.space_action_global)
 
         # Download selected
-        QShortcut(QKeySequence("Ctrl+D"), self, activated=self.download_selected)
-        QShortcut(QKeySequence("Ctrl+Return"), self, activated=self.download_selected)
-        QShortcut(QKeySequence("Ctrl+Enter"), self, activated=self.download_selected)
+        sc = QShortcut(QKeySequence("Ctrl+D"), self)
+        sc.activated.connect(self.download_selected)
+        sc = QShortcut(QKeySequence("Ctrl+Return"), self)
+        sc.activated.connect(self.download_selected)
+        sc = QShortcut(QKeySequence("Ctrl+Enter"), self)
+        sc.activated.connect(self.download_selected)
 
         # Toggle console visibility
-        QShortcut(QKeySequence("Ctrl+`"), self, activated=lambda: self.show_console_cb.toggle())
+        sc = QShortcut(QKeySequence("Ctrl+`"), self)
+        sc.activated.connect(lambda: self.show_console_cb.toggle())
         # Toggle debug logging
-        QShortcut(QKeySequence("Ctrl+B"), self, activated=lambda: self.debug_checkbox.toggle())
+        sc = QShortcut(QKeySequence("Ctrl+B"), self)
+        sc.activated.connect(lambda: self.debug_checkbox.toggle())
 
         # Shortcuts help
-        QShortcut(QKeySequence("F1"), self, activated=self.show_shortcuts)
-        QShortcut(QKeySequence("Ctrl+/"), self, activated=self.show_shortcuts)
+        sc = QShortcut(QKeySequence("F1"), self)
+        sc.activated.connect(self.show_shortcuts)
+        sc = QShortcut(QKeySequence("Ctrl+/"), self)
+        sc.activated.connect(self.show_shortcuts)
+
+        # Refresh library
+        sc = QShortcut(QKeySequence("F5"), self)
+        sc.activated.connect(self.refresh_library)
 
         # Library navigate J/K optional, Up/Down handled by LibraryTable
-        QShortcut(QKeySequence("J"), self, activated=self.lib_select_next)
-        QShortcut(QKeySequence("K"), self, activated=self.lib_select_prev)
+        sc = QShortcut(QKeySequence("J"), self)
+        sc.activated.connect(self.lib_select_next)
+        sc = QShortcut(QKeySequence("K"), self)
+        sc.activated.connect(self.lib_select_prev)
 
     def show_shortcuts(self):
         dlg = QDialog(self)
@@ -817,12 +1012,19 @@ class MainWindow(QWidget):
         self.search_list.clear()
         self.reco_list.clear()
         self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)  # Busy indicator during network calls
+        self.network_progress_active = True
+        self.update_progress_visibility()
         event_log(f"Searching: {query}")
         worker = SearchWorker(self.ytmusic, query)
         worker.results_ready.connect(self.handle_search_results)
         worker.error_occurred.connect(self.handle_search_error)
         worker.finished.connect(lambda: self.cleanup_worker(worker))
-        worker.finished.connect(lambda: self.progress_bar.setVisible(False))
+        def _end_net():
+            self.network_progress_active = False
+            self.progress_bar.setRange(0, 100)
+            self.update_progress_visibility()
+        worker.finished.connect(_end_net)
         self.active_workers.append(worker)
         worker.start()
 
@@ -856,20 +1058,35 @@ class MainWindow(QWidget):
         idx = self.search_list.currentRow()
         if idx < 0 or idx >= len(self.search_results):
             return
-        video_id = self.search_results[idx].get("videoId")
+        result = self.search_results[idx]
+        video_id = result.get("videoId")
         if not video_id:
+            # Fallback: search by title + artist
+            title = result.get("title") or ""
+            artists = ", ".join(a.get("name", "") for a in result.get("artists", []) if a.get("name"))
+            query = f"{title} {artists}".strip()
+            if query:
+                event_log(f"No direct videoId for selection; searching for: {query}")
+                self.search_and_start_recos_by_title(query)
             return
         self.start_youtube_recos(video_id)
 
     def start_youtube_recos(self, video_id: str):
         """Start a RecommendationWorker and show results in reco_list."""
         self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)  # Busy indicator during network calls
+        self.network_progress_active = True
+        self.update_progress_visibility()
         event_log("Loading YouTube recommendations...")
         worker = RecommendationWorker(self.ytmusic, video_id)
         worker.recommendations_ready.connect(self.handle_recommendations)
         worker.error_occurred.connect(self.handle_recommendation_error)
         worker.finished.connect(lambda: self.cleanup_worker(worker))
-        worker.finished.connect(lambda: self.progress_bar.setVisible(False))
+        def _end_net():
+            self.network_progress_active = False
+            self.progress_bar.setRange(0, 100)
+            self.update_progress_visibility()
+        worker.finished.connect(_end_net)
         self.active_workers.append(worker)
         worker.start()
 
@@ -960,10 +1177,16 @@ class MainWindow(QWidget):
 
     # ---------- Download ----------
     def download_selected(self):
+        # Debounce: if a download is already in progress, ignore rapid presses
+        if self.download_in_progress > 0:
+            event_log("Download already in progress; ignoring duplicate request")
+            return
         selected_items = self.reco_list.selectedItems()
         if not selected_items:
             return
         start_count = 0
+        # Disable button to prevent repeated Ctrl+D spamming
+        self.download_btn.setEnabled(False)
         for item in selected_items:
             row = self.reco_list.row(item)
             if row < 0 or row >= len(self.reco_tracks):
@@ -981,27 +1204,71 @@ class MainWindow(QWidget):
             worker.done.connect(self.download_finished)
             worker.error.connect(self.download_error)
             worker.finished.connect(lambda w=worker: self.cleanup_worker(w))
+            # When each worker finishes, decrement counter and re-enable btn if none remain
+            def _on_worker_finished():
+                self.download_in_progress = max(0, self.download_in_progress - 1)
+                if self.download_in_progress == 0:
+                    self.download_btn.setEnabled(True)
+            worker.finished.connect(_on_worker_finished)
             self.active_workers.append(worker)
             start_count += 1
+            self.download_in_progress += 1
             worker.start()
         if start_count > 0:
             event_log(f"Downloading selected: {start_count} track(s)")
+        else:
+            # Nothing started; re-enable the button
+            self.download_btn.setEnabled(True)
 
     def download_error(self, error_msg):
         GUI_LOGGER.log.emit(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] [ERROR] Download error: {error_msg}")
 
     def download_finished(self, path, video_id, artist):
         # Keep pending meta for when analysis completes and file is renamed
-        self.pending_meta_by_path[path] = {"video_id": video_id, "artist": artist}
+        base_title = Path(path).stem
+        self.pending_meta_by_path[path] = {"video_id": video_id, "artist": artist or "", "title": base_title}
         if not path or not Path(path).exists():
             GUI_LOGGER.log.emit(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] [ERROR] Downloaded file not found")
             return
         worker = AudioAnalysisWorker(path)
         worker.analysis_complete.connect(self.handle_audio_analysis)
         worker.error_occurred.connect(self.handle_analysis_error)
-        worker.finished.connect(lambda: self.cleanup_worker(worker))
+        # Analysis progress plumbing
+        worker.progress_update.connect(self.handle_analysis_progress)
+        self.analysis_progress_active = True
+        self.update_progress_visibility()
         self.active_workers.append(worker)
         worker.start()
+
+    # ---------- Artist enrichment ----------
+    def _enrich_artist(self, video_id: str | None, title_guess: str) -> str:
+        """Try to fetch artist via YTMusic using video_id or title.
+        Returns artist string or empty if not found."""
+        if not self.ytmusic:
+            return ""
+        # Prefer title search; 'get_song' may not return structured artists reliably
+        try:
+            q = title_guess.strip()
+            if q:
+                results = self.ytmusic.search(q, filter="songs", limit=1)
+                if results:
+                    artists_list = results[0].get("artists", [])
+                    artist_str = ", ".join(a.get("name", "") for a in artists_list if a.get("name"))
+                    return artist_str
+        except Exception:
+            pass
+        # Fallback: try watch playlist to infer first track
+        try:
+            if video_id:
+                watch = self.ytmusic.get_watch_playlist(video_id)
+                tracks = watch.get("tracks", [])
+                if tracks:
+                    artists_list = tracks[0].get("artists", [])
+                    artist_str = ", ".join(a.get("name", "") for a in artists_list if a.get("name"))
+                    return artist_str
+        except Exception:
+            pass
+        return ""
 
     # ---------- Post-processing ----------
     def handle_audio_analysis(self, original_path, bpm, camelot):
@@ -1023,14 +1290,22 @@ class MainWindow(QWidget):
 
             # Write metadata sidecar with artist and video_id
             meta_src = self.pending_meta_by_path.pop(str(original_path), {})
+            # Use extracted title from filename for display; more consistent than raw base
+            display_title = extract_title(final_path.name)
+            artist_val = meta_src.get("artist", "")
+            if not artist_val:
+                # Try to enrich artist if missing
+                artist_val = self._enrich_artist(meta_src.get("video_id"), display_title) or ""
             meta = {
-                "title": safe_title,
-                "artist": meta_src.get("artist", ""),
+                "title": display_title,
+                "artist": artist_val,
                 "video_id": meta_src.get("video_id", ""),
                 "bpm": bpm,
                 "camelot": camelot
             }
             write_metadata(final_path, meta)
+            # Also embed ID3 tags if possible
+            embed_id3_tags(final_path, meta)
 
             if self.current_bpm is None and bpm:
                 self.current_bpm = bpm
@@ -1040,9 +1315,21 @@ class MainWindow(QWidget):
             self.library_timer.start(300)
         except Exception as e:
             GUI_LOGGER.log.emit(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] [ERROR] Post-process error: {e}")
+        finally:
+            # End analysis progress display if no other analysis active
+            self.analysis_progress_active = False
+            self.update_progress_visibility()
 
     def handle_analysis_error(self, error):
         GUI_LOGGER.log.emit(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] [ERROR] Analysis error: {error}")
+        self.analysis_progress_active = False
+        self.update_progress_visibility()
+
+    def handle_analysis_progress(self, percent: int, stage: str):
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(max(0, min(100, percent)))
+        self.progress_bar.setFormat(f"Analyzing… {percent}% – {stage}")
+        self.progress_bar.setVisible(True)
 
     # ---------- Library ----------
     def refresh_library_delayed(self):
@@ -1086,7 +1373,7 @@ class MainWindow(QWidget):
                 self.bpm_index.setdefault(bpm, []).append(item)
 
             bpm_txt = str(bpm) if bpm is not None else "UNK"
-            key_txt = key if key else "UNK"
+            key_txt = key if key is not None else "UNK"
             self.library.setItem(row, 0, QTableWidgetItem(bpm_txt))
             self.library.setItem(row, 1, QTableWidgetItem(key_txt))
             self.library.setItem(row, 2, QTableWidgetItem(title))
@@ -1167,7 +1454,7 @@ class MainWindow(QWidget):
         best = scored[:10]
         for total, item in best:
             bpm_txt = str(item["bpm"]) if item["bpm"] is not None else "UNK"
-            key_txt = item["key"] if item["key"] else "UNK"
+            key_txt = item["key"] if item["key"] is not None else "UNK"
             self.next_up_list.addItem(f'{total}% - {item["title"]} ({bpm_txt} BPM, {key_txt})')
         event_log(f"Next up (top {len(best)}) for: {cur_title}")
 
@@ -1187,18 +1474,21 @@ class MainWindow(QWidget):
                 worker.wait(2000)
         event.accept()
 
-# ================= ENTRY =================
-def main():
-    app = QApplication(sys.argv)
-    # Check dependency: yt_dlp
-    try:
-        import yt_dlp  # noqa: F401
-    except ImportError:
-        print("Error: yt-dlp not installed. Install with: pip install yt-dlp")
-        sys.exit(1)
-    win = MainWindow()
-    win.show()
-    sys.exit(app.exec())
+    def update_progress_visibility(self):
+        # Show progress bar if either network or analysis work is active
+        visible = self.network_progress_active or self.analysis_progress_active
+        self.progress_bar.setVisible(visible)
+        if not visible:
+            # Reset format for next time
+            self.progress_bar.setFormat("%p%")
+            self.progress_bar.setValue(0)
 
-if __name__ == "__main__":
-    main()
+    def queue_recommendations_for_current(self):
+        """Debounce auto-loading of YouTube recommendations when selection changes."""
+        # Avoid triggering during empty state
+        if self.search_list.currentRow() < 0 or not self.search_results:
+            return
+        # Start a short timer; if user navigates quickly, only last selection triggers
+        self.reco_timer.stop()
+        self.reco_timer.start(350)
+
